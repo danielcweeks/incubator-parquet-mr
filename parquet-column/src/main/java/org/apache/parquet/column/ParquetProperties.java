@@ -69,6 +69,8 @@ public class ParquetProperties {
 
   public static final boolean DEFAULT_PAGE_WRITE_CHECKSUM_ENABLED = true;
 
+  public static final boolean DEFAULT_NON_CONTIGUOUS_PAGE_WRITE_ENABLED = false;
+
   /**
    * @deprecated This shared instance can cause thread safety issues when used by multiple builders concurrently.
    * Use {@code new DefaultValuesWriterFactory()} instead to create individual instances.
@@ -131,6 +133,7 @@ public class ParquetProperties {
   private final int rowGroupRowCountLimit;
   private final int pageRowCountLimit;
   private final boolean pageWriteChecksumEnabled;
+  private final boolean nonContiguousPageWriteEnabled;
   private final ColumnProperty<ByteStreamSplitMode> byteStreamSplitEnabled;
   private final Map<String, String> extraMetaData;
   private final ColumnProperty<Boolean> statistics;
@@ -163,6 +166,7 @@ public class ParquetProperties {
     this.rowGroupRowCountLimit = builder.rowGroupRowCountLimit;
     this.pageRowCountLimit = builder.pageRowCountLimit;
     this.pageWriteChecksumEnabled = builder.pageWriteChecksumEnabled;
+    this.nonContiguousPageWriteEnabled = builder.nonContiguousPageWriteEnabled;
     this.byteStreamSplitEnabled = builder.byteStreamSplitEnabled.build();
     this.extraMetaData = builder.extraMetaData;
     this.statistics = builder.statistics.build();
@@ -322,6 +326,17 @@ public class ParquetProperties {
     return pageWriteChecksumEnabled;
   }
 
+  /**
+   * @return whether non-contiguous page writes are enabled for this writer. When {@code true},
+   *         a column chunk's pages are not required to be laid out contiguously in the file;
+   *         page writers may produce new pages at any point during the write process. The
+   *         resulting file records {@code data_page_offset = -1} on each column chunk to
+   *         signal to readers that pages must be located via the OffsetIndex.
+   */
+  public boolean isNonContiguousPageWriteEnabled() {
+    return nonContiguousPageWriteEnabled;
+  }
+
   public OptionalLong getBloomFilterNDV(ColumnDescriptor column) {
     Long ndv = bloomFilterNDVs.getValue(column);
     return ndv == null ? OptionalLong.empty() : OptionalLong.of(ndv);
@@ -415,6 +430,7 @@ public class ParquetProperties {
     private int rowGroupRowCountLimit = DEFAULT_ROW_GROUP_ROW_COUNT_LIMIT;
     private int pageRowCountLimit = DEFAULT_PAGE_ROW_COUNT_LIMIT;
     private boolean pageWriteChecksumEnabled = DEFAULT_PAGE_WRITE_CHECKSUM_ENABLED;
+    private boolean nonContiguousPageWriteEnabled = DEFAULT_NON_CONTIGUOUS_PAGE_WRITE_ENABLED;
     private final ColumnProperty.Builder<ByteStreamSplitMode> byteStreamSplitEnabled;
     private Map<String, String> extraMetaData = new HashMap<>();
     private final ColumnProperty.Builder<Boolean> statistics;
@@ -450,6 +466,7 @@ public class ParquetProperties {
       this.allocator = toCopy.allocator;
       this.pageRowCountLimit = toCopy.pageRowCountLimit;
       this.pageWriteChecksumEnabled = toCopy.pageWriteChecksumEnabled;
+      this.nonContiguousPageWriteEnabled = toCopy.nonContiguousPageWriteEnabled;
       this.bloomFilterNDVs = ColumnProperty.builder(toCopy.bloomFilterNDVs);
       this.bloomFilterFPPs = ColumnProperty.builder(toCopy.bloomFilterFPPs);
       this.bloomFilterEnabled = ColumnProperty.builder(toCopy.bloomFilterEnabled);
@@ -706,6 +723,21 @@ public class ParquetProperties {
 
     public Builder withPageWriteChecksumEnabled(boolean val) {
       this.pageWriteChecksumEnabled = val;
+      return this;
+    }
+
+    /**
+     * Enable or disable non-contiguous page writes. When enabled, a column chunk's pages
+     * are not required to be laid out contiguously in the file; page writers may produce
+     * new pages at any point during the write process. The resulting file records
+     * {@code data_page_offset = -1} on each column chunk, and readers must use the
+     * OffsetIndex to locate individual pages.
+     *
+     * @param enabled whether non-contiguous page writes should be enabled
+     * @return this builder for method chaining.
+     */
+    public Builder withNonContiguousPageWriteEnabled(boolean enabled) {
+      this.nonContiguousPageWriteEnabled = enabled;
       return this;
     }
 
