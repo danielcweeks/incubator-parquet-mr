@@ -75,8 +75,14 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
     private final BytesInputCompressor compressor;
 
     private final ByteArrayOutputStream tempOutputStream = new ByteArrayOutputStream();
+    // Null when {@code nonContiguousPageWriteEnabled} is true — pages are flushed directly
+    // to the file as soon as they are produced, so we never need an in-memory accumulator.
     private final ConcatenatingByteBufferCollector buf;
     private DictionaryPage dictionaryPage;
+    // Recorded when a dictionary page is flushed directly in non-contiguous mode.
+    private long dictionaryPageOffset;
+    private int dictionaryPageLength = -1;
+    private Encoding dictionaryEncoding;
 
     private long uncompressedLength;
     private long compressedLength;
@@ -109,6 +115,11 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
     private final byte[] dataPageHeaderAAD;
     private final byte[] fileAAD;
 
+    // Non-contiguous mode: when enabled, pages are written through {@code parquetFileWriter}
+    // as soon as they are produced. Both fields are null when disabled.
+    private final boolean nonContiguousPageWriteEnabled;
+    private final ParquetFileWriter parquetFileWriter;
+
     private ColumnChunkPageWriter(
         ColumnDescriptor path,
         BytesInputCompressor compressor,
@@ -119,12 +130,16 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
         BlockCipher.Encryptor pageBlockEncryptor,
         byte[] fileAAD,
         int rowGroupOrdinal,
-        int columnOrdinal) {
+        int columnOrdinal,
+        boolean nonContiguousPageWriteEnabled,
+        ParquetFileWriter parquetFileWriter) {
       this.path = path;
       this.compressor = compressor;
       this.allocator = allocator;
       this.releaser = new ByteBufferReleaser(allocator);
-      this.buf = new ConcatenatingByteBufferCollector(allocator);
+      this.nonContiguousPageWriteEnabled = nonContiguousPageWriteEnabled;
+      this.parquetFileWriter = parquetFileWriter;
+      this.buf = nonContiguousPageWriteEnabled ? null : new ConcatenatingByteBufferCollector(allocator);
       this.columnIndexBuilder = ColumnIndexBuilder.getBuilder(path.getPrimitiveType(), columnIndexTruncateLength);
       this.offsetIndexBuilder = OffsetIndexBuilder.getBuilder();
       this.totalSizeStatistics = SizeStatistics.newBuilder(
@@ -251,17 +266,45 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
       this.pageCount += 1;
 
       mergeColumnStatistics(statistics, sizeStatistics, geospatialStatistics);
-      offsetIndexBuilder.add(
-          toIntWithCheck(tempOutputStream.size() + compressedSize),
-          rowCount,
-          sizeStatistics != null ? sizeStatistics.getUnencodedByteArrayDataBytes() : Optional.empty());
 
-      // by concatenating before collecting instead of collecting twice,
-      // we only allocate one buffer to copy into instead of multiple.
-      buf.collect(BytesInput.concat(BytesInput.from(tempOutputStream), compressedBytes));
+      int headerSize = tempOutputStream.size();
+      BytesInput pageBytes = BytesInput.concat(BytesInput.from(tempOutputStream), compressedBytes);
+      int pageBytesSize = toIntWithCheck((long) headerSize + compressedSize);
+      if (nonContiguousPageWriteEnabled) {
+        long pageOffset = parquetFileWriter.writePageBytesNonContiguous(pageBytes);
+        offsetIndexBuilder.add(
+            pageOffset,
+            pageBytesSize,
+            // first_row_index is accumulated by the relative-offset overload's running
+            // counters; for the absolute overload we compute it explicitly.
+            firstRowIndexForPage(rowCount),
+            sizeStatistics != null ? sizeStatistics.getUnencodedByteArrayDataBytes() : Optional.empty());
+        // The contiguous path adds page header sizes inside ParquetFileWriter.writeColumnChunk
+        // by subtracting the payload total from the buffered bytes size. Non-contiguous mode
+        // bypasses that step, so we add header sizes here.
+        this.uncompressedLength += headerSize;
+        this.compressedLength += headerSize;
+      } else {
+        offsetIndexBuilder.add(
+            pageBytesSize,
+            rowCount,
+            sizeStatistics != null ? sizeStatistics.getUnencodedByteArrayDataBytes() : Optional.empty());
+        // by concatenating before collecting instead of collecting twice,
+        // we only allocate one buffer to copy into instead of multiple.
+        buf.collect(pageBytes);
+      }
       rlEncodings.add(rlEncoding);
       dlEncodings.add(dlEncoding);
       dataEncodings.add(valuesEncoding);
+    }
+
+    // Tracks the next page's first row index for the absolute-offset OffsetIndex add path.
+    private long nextFirstRowIndex = 0;
+
+    private long firstRowIndexForPage(int rowCountForThisPage) {
+      long result = nextFirstRowIndex;
+      nextFirstRowIndex += rowCountForThisPage;
+      return result;
     }
 
     @Override
@@ -371,15 +414,30 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
       this.pageCount += 1;
 
       mergeColumnStatistics(statistics, sizeStatistics, geospatialStatistics);
-      offsetIndexBuilder.add(
-          toIntWithCheck((long) tempOutputStream.size() + compressedSize),
-          rowCount,
-          sizeStatistics != null ? sizeStatistics.getUnencodedByteArrayDataBytes() : Optional.empty());
 
-      // by concatenating before collecting instead of collecting twice,
-      // we only allocate one buffer to copy into instead of multiple.
-      buf.collect(BytesInput.concat(
-          BytesInput.from(tempOutputStream), repetitionLevels, definitionLevels, compressedData));
+      int headerSize = tempOutputStream.size();
+      BytesInput pageBytes = BytesInput.concat(
+          BytesInput.from(tempOutputStream), repetitionLevels, definitionLevels, compressedData);
+      int pageBytesSize = toIntWithCheck((long) headerSize + compressedSize);
+      if (nonContiguousPageWriteEnabled) {
+        long pageOffset = parquetFileWriter.writePageBytesNonContiguous(pageBytes);
+        offsetIndexBuilder.add(
+            pageOffset,
+            pageBytesSize,
+            firstRowIndexForPage(rowCount),
+            sizeStatistics != null ? sizeStatistics.getUnencodedByteArrayDataBytes() : Optional.empty());
+        // Add page header size; see writePage() for why this is needed.
+        this.uncompressedLength += headerSize;
+        this.compressedLength += headerSize;
+      } else {
+        offsetIndexBuilder.add(
+            pageBytesSize,
+            rowCount,
+            sizeStatistics != null ? sizeStatistics.getUnencodedByteArrayDataBytes() : Optional.empty());
+        // by concatenating before collecting instead of collecting twice,
+        // we only allocate one buffer to copy into instead of multiple.
+        buf.collect(pageBytes);
+      }
       dataEncodings.add(dataEncoding);
     }
 
@@ -423,11 +481,34 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
 
     @Override
     public long getMemSize() {
-      return buf.size();
+      // In non-contiguous mode pages are flushed to the file as soon as they are produced,
+      // so the page writer holds no buffered bytes.
+      return buf != null ? buf.size() : 0L;
     }
 
     public void writeToFileWriter(ParquetFileWriter writer) throws IOException {
-      if (null == headerBlockEncryptor) {
+      if (nonContiguousPageWriteEnabled) {
+        // Pages and (if any) the dictionary page have already been flushed directly to the
+        // file. Finalize the column chunk metadata only; no payload is written here.
+        writer.writeColumnChunkNonContiguous(
+            path,
+            totalValueCount,
+            compressor.getCodecName(),
+            dictionaryPageLength > 0 ? dictionaryPageOffset : 0,
+            dictionaryPageLength,
+            dictionaryEncoding,
+            uncompressedLength,
+            compressedLength,
+            totalStatistics,
+            totalSizeStatistics,
+            totalGeospatialStatistics,
+            columnIndexBuilder,
+            offsetIndexBuilder,
+            bloomFilter,
+            rlEncodings,
+            dlEncodings,
+            dataEncodings);
+      } else if (null == headerBlockEncryptor) {
         writer.writeColumnChunk(
             path,
             totalValueCount,
@@ -469,9 +550,10 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
             fileAAD);
       }
       if (LOG.isDebugEnabled()) {
+        long bufSize = (buf != null) ? buf.size() : compressedLength;
         LOG.debug(String.format(
                 "written %,dB for %s: %,d values, %,dB raw, %,dB comp, %d pages, encodings: %s",
-                buf.size(),
+                bufSize,
                 path,
                 totalValueCount,
                 uncompressedLength,
@@ -495,12 +577,12 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
 
     @Override
     public long allocatedSize() {
-      return buf.size();
+      return buf != null ? buf.size() : 0L;
     }
 
     @Override
     public void writeDictionaryPage(DictionaryPage dictionaryPage) throws IOException {
-      if (this.dictionaryPage != null) {
+      if (this.dictionaryPage != null || this.dictionaryPageLength > 0) {
         throw new ParquetEncodingException("Only one dictionary page is allowed");
       }
       BytesInput dictionaryBytes = dictionaryPage.getBytes();
@@ -512,21 +594,44 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
         compressedBytes =
             BytesInput.from(pageBlockEncryptor.encrypt(compressedBytes.toByteArray(), dictonaryPageAAD));
       }
-      this.dictionaryPage = new DictionaryPage(
+      DictionaryPage compressedDictionaryPage = new DictionaryPage(
           compressedBytes.copy(releaser),
           uncompressedSize,
           dictionaryPage.getDictionarySize(),
           dictionaryPage.getEncoding());
+      if (nonContiguousPageWriteEnabled) {
+        // Flush the dictionary page to the file immediately so we don't hold a buffered copy.
+        long[] offsetAndLen =
+            parquetFileWriter.writeDictionaryPageNonContiguous(compressedDictionaryPage, null, null);
+        long totalWritten = offsetAndLen[1]; // header + (possibly encrypted) compressed payload
+        long headerSize = totalWritten - compressedBytes.size();
+        this.dictionaryPageOffset = offsetAndLen[0];
+        this.dictionaryPageLength = Math.toIntExact(totalWritten);
+        this.dictionaryEncoding = compressedDictionaryPage.getEncoding();
+        // Mirror the bookkeeping that ParquetFileWriter.writeDictionaryPage performs for the
+        // contiguous path so totals reported to the column metadata are consistent.
+        this.uncompressedLength += uncompressedSize + headerSize;
+        this.compressedLength += totalWritten;
+      } else {
+        this.dictionaryPage = compressedDictionaryPage;
+      }
     }
 
     @Override
     public String memUsageString(String prefix) {
+      if (buf == null) {
+        return prefix + " ColumnChunkPageWriter{streaming, 0B}";
+      }
       return buf.memUsageString(prefix + " ColumnChunkPageWriter");
     }
 
     @Override
     public void close() {
-      AutoCloseables.uncheckedClose(buf, releaser);
+      if (buf != null) {
+        AutoCloseables.uncheckedClose(buf, releaser);
+      } else {
+        AutoCloseables.uncheckedClose(releaser);
+      }
     }
 
     @Override
@@ -596,7 +701,9 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
               null,
               null,
               -1,
-              -1));
+              -1,
+              false,
+              null));
     }
   }
 
@@ -627,6 +734,54 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
       boolean pageWriteChecksumEnabled,
       InternalFileEncryptor fileEncryptor,
       int rowGroupOrdinal) {
+    this(
+        compressor,
+        schema,
+        allocator,
+        columnIndexTruncateLength,
+        pageWriteChecksumEnabled,
+        fileEncryptor,
+        rowGroupOrdinal,
+        false,
+        null);
+  }
+
+  /**
+   * Construct a {@code ColumnChunkPageWriteStore} that may flush pages directly to a
+   * {@link ParquetFileWriter} as they are produced.
+   *
+   * @param nonContiguousPageWriteEnabled  when {@code true}, every page written via
+   *                                       {@link ColumnChunkPageWriter#writePage} (and its
+   *                                       variants) is flushed to the {@code parquetFileWriter}
+   *                                       immediately, and {@link #flushToFileWriter} finalizes
+   *                                       only per-column metadata. When {@code false},
+   *                                       behavior is unchanged from the legacy
+   *                                       buffer-and-flush path.
+   * @param parquetFileWriter              the writer pages are flushed to when
+   *                                       {@code nonContiguousPageWriteEnabled} is {@code true};
+   *                                       may be {@code null} otherwise
+   * @throws UnsupportedOperationException if non-contiguous page writes and column encryption
+   *                                       are requested together. Encryption support for
+   *                                       non-contiguous mode is not yet implemented.
+   */
+  public ColumnChunkPageWriteStore(
+      BytesInputCompressor compressor,
+      MessageType schema,
+      ByteBufferAllocator allocator,
+      int columnIndexTruncateLength,
+      boolean pageWriteChecksumEnabled,
+      InternalFileEncryptor fileEncryptor,
+      int rowGroupOrdinal,
+      boolean nonContiguousPageWriteEnabled,
+      ParquetFileWriter parquetFileWriter) {
+    if (nonContiguousPageWriteEnabled && fileEncryptor != null) {
+      throw new UnsupportedOperationException(
+          "Non-contiguous page writes are not supported in combination with column encryption.");
+    }
+    if (nonContiguousPageWriteEnabled && parquetFileWriter == null) {
+      throw new IllegalArgumentException(
+          "parquetFileWriter must be provided when non-contiguous page writes are enabled.");
+    }
     this.schema = schema;
     if (null == fileEncryptor) {
       for (ColumnDescriptor path : schema.getColumns()) {
@@ -642,7 +797,9 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
                 null,
                 null,
                 -1,
-                -1));
+                -1,
+                nonContiguousPageWriteEnabled,
+                parquetFileWriter));
       }
       return;
     }
@@ -674,7 +831,9 @@ public class ColumnChunkPageWriteStore implements PageWriteStore, BloomFilterWri
               pageBlockEncryptor,
               fileAAD,
               rowGroupOrdinal,
-              columnOrdinal));
+              columnOrdinal,
+              false,
+              null));
     }
   }
 

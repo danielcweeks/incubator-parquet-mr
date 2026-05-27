@@ -772,6 +772,21 @@ public class ParquetWriter<T> implements Closeable {
     }
 
     /**
+     * Enable or disable non-contiguous page writes. When enabled, a column chunk's pages
+     * are not required to be laid out contiguously in the file; page writers may produce
+     * new pages at any point during the write process. The resulting file records
+     * {@code data_page_offset = -1} on each column chunk, and readers must use the
+     * OffsetIndex to locate individual pages.
+     *
+     * @param enabled whether non-contiguous page writes should be enabled
+     * @return this builder for method chaining.
+     */
+    public SELF withNonContiguousPageWriteEnabled(boolean enabled) {
+      encodingPropsBuilder.withNonContiguousPageWriteEnabled(enabled);
+      return self();
+    }
+
+    /**
      * Set max Bloom filter bytes for related columns.
      *
      * @param maxBloomFilterBytes the max bytes of a Bloom filter bitset for a column.

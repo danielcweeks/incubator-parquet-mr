@@ -590,10 +590,18 @@ public class ParquetMetadataConverter {
     int rowGroupOrdinal = rowGroups.size();
     int columnOrdinal = -1;
     ByteArrayOutputStream tempOutStream = null;
+    boolean blockHasNonContiguousColumn = false;
     for (ColumnChunkMetaData columnMetaData : columns) {
+      // For non-contiguous page layouts the writer records data_page_offset = -1 on the
+      // ColumnMetaData; the on-disk ColumnChunk.file_offset must also be -1 so that older
+      // readers (which seek to that offset) fail loudly rather than reading invalid data.
+      boolean nonContiguous = columnMetaData.getFirstDataPageOffset() == -1;
+      if (nonContiguous) {
+        blockHasNonContiguousColumn = true;
+      }
       // There is no ColumnMetaData written after the chunk data, so set the ColumnChunk
-      // file_offset to 0
-      ColumnChunk columnChunk = new ColumnChunk(0);
+      // file_offset to 0 (or -1 for non-contiguous chunks).
+      ColumnChunk columnChunk = new ColumnChunk(nonContiguous ? -1L : 0L);
       columnChunk.file_path = block.getPath(); // they are in the same file for now
       InternalColumnEncryptionSetup columnSetup = null;
       boolean writeCryptoMetadata = false;
@@ -618,6 +626,9 @@ public class ParquetMetadataConverter {
               && columnMetaData.getEncodingStats().hasDictionaryPages())
           || columnMetaData.hasDictionaryPage()) {
         metaData.setDictionary_page_offset(columnMetaData.getDictionaryPageOffset());
+        if (columnMetaData.getDictionaryPageLength() > 0) {
+          metaData.setDictionary_page_length(columnMetaData.getDictionaryPageLength());
+        }
       }
       long bloomFilterOffset = columnMetaData.getBloomFilterOffset();
       if (bloomFilterOffset >= 0) {
@@ -697,7 +708,11 @@ public class ParquetMetadataConverter {
       parquetColumns.add(columnChunk);
     }
     RowGroup rowGroup = new RowGroup(parquetColumns, block.getTotalByteSize(), block.getRowCount());
-    rowGroup.setFile_offset(block.getStartingPos());
+    // RowGroup.file_offset is omitted when any column in the row group uses non-contiguous
+    // pages — there is no single starting offset for the block in that mode.
+    if (!blockHasNonContiguousColumn) {
+      rowGroup.setFile_offset(block.getStartingPos());
+    }
     rowGroup.setTotal_compressed_size(block.getCompressedSize());
     rowGroup.setOrdinal((short) rowGroupOrdinal);
     rowGroups.add(rowGroup);
@@ -1916,6 +1931,9 @@ public class ParquetMetadataConverter {
             }
             if (metaData.isSetBloom_filter_length()) {
               column.setBloomFilterLength(metaData.getBloom_filter_length());
+            }
+            if (metaData.isSetDictionary_page_length()) {
+              column.setDictionaryPageLength(metaData.getDictionary_page_length());
             }
           } else { // column encrypted with column key
             // Metadata will be decrypted later, if this column is accessed
