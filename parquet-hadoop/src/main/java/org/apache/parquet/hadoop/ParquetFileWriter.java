@@ -170,6 +170,7 @@ public class ParquetFileWriter implements AutoCloseable {
   private long currentChunkValueCount; // set in startColumn
   private long currentChunkFirstDataPage; // set in startColumn & page writes
   private long currentChunkDictionaryPageOffset; // set in writeDictionaryPage
+  private int currentChunkDictionaryPageLength; // set in writeDictionaryPage / set externally for non-contiguous chunks
 
   // set when end is called
   private ParquetMetadata footer = null;
@@ -652,6 +653,8 @@ public class ParquetFileWriter implements AutoCloseable {
       currentChunkCodec = compressionCodecName;
       currentChunkValueCount = valueCount;
       currentChunkFirstDataPage = -1;
+      currentChunkDictionaryPageOffset = 0;
+      currentChunkDictionaryPageLength = -1;
       compressedLength = 0;
       uncompressedLength = 0;
       // The statistics will be copied from the first one added at writeDataPage(s) so we have the correct typed
@@ -719,6 +722,7 @@ public class ParquetFileWriter implements AutoCloseable {
       dictionaryPage
           .getBytes()
           .writeAllTo(out); // for encrypted column, dictionary page bytes are already encrypted
+      currentChunkDictionaryPageLength = Math.toIntExact(out.getPos() - currentChunkDictionaryPageOffset);
       encodingStatsBuilder.addDictEncoding(dictionaryPage.getEncoding());
       currentEncodings.add(dictionaryPage.getEncoding());
     });
@@ -1564,6 +1568,174 @@ public class ParquetFileWriter implements AutoCloseable {
   }
 
   /**
+   * Streaming-write primitive used by {@link ColumnChunkPageWriteStore} when non-contiguous
+   * page writes are enabled. Writes a serialized page (page header followed by compressed
+   * payload) at the current file position and returns that position.
+   *
+   * <p>This method does <b>not</b> mutate any per-column tracking fields; callers are
+   * responsible for tracking the returned offset in their own OffsetIndex builder. It may be
+   * called between {@link #startBlock(long)} and {@link #endBlock()} without first calling
+   * {@link #startColumn(ColumnDescriptor, long, CompressionCodecName)}.
+   *
+   * @param pageBytes the fully serialized page (header + compressed payload) to write
+   * @return the absolute file offset at which the page was written
+   * @throws IOException if there is an error while writing
+   */
+  long writePageBytesNonContiguous(BytesInput pageBytes) throws IOException {
+    long offset = out.getPos();
+    pageBytes.writeAllTo(out);
+    return offset;
+  }
+
+  /**
+   * Streaming-write primitive used by {@link ColumnChunkPageWriteStore} to flush a dictionary
+   * page mid-row-group when non-contiguous page writes are enabled. Serializes the dictionary
+   * page header followed by the (already-compressed) dictionary bytes at the current file
+   * position, and returns a two-element array containing the {@code [offset, lengthIncludingHeader]}.
+   *
+   * <p>This method does not touch any per-column writer state — interleaving dictionary
+   * pages from multiple columns is safe.
+   *
+   * @param dictionaryPage     the dictionary page (compressed bytes; for encrypted columns the
+   *                           bytes are already encrypted)
+   * @param headerBlockEncryptor optional encryptor for the page header (typically null in this
+   *                           initial increment, since encryption is not yet supported in
+   *                           non-contiguous mode)
+   * @param AAD                additional authenticated data for header encryption (or null)
+   * @return a two-element array {@code [offset, lengthIncludingHeader]}
+   * @throws IOException if there is an error while writing
+   */
+  long[] writeDictionaryPageNonContiguous(
+      DictionaryPage dictionaryPage, BlockCipher.Encryptor headerBlockEncryptor, byte[] AAD)
+      throws IOException {
+    long startPos = out.getPos();
+    int uncompressedSize = dictionaryPage.getUncompressedSize();
+    int compressedPageSize = Math.toIntExact(dictionaryPage.getBytes().size());
+    if (pageWriteChecksumEnabled) {
+      crc.reset();
+      crcUpdate(dictionaryPage.getBytes());
+      metadataConverter.writeDictionaryPageHeader(
+          uncompressedSize,
+          compressedPageSize,
+          dictionaryPage.getDictionarySize(),
+          dictionaryPage.getEncoding(),
+          (int) crc.getValue(),
+          out,
+          headerBlockEncryptor,
+          AAD);
+    } else {
+      metadataConverter.writeDictionaryPageHeader(
+          uncompressedSize,
+          compressedPageSize,
+          dictionaryPage.getDictionarySize(),
+          dictionaryPage.getEncoding(),
+          out,
+          headerBlockEncryptor,
+          AAD);
+    }
+    dictionaryPage.getBytes().writeAllTo(out);
+    long endPos = out.getPos();
+    return new long[] {startPos, endPos - startPos};
+  }
+
+  /**
+   * Finalizes the column chunk metadata for a column whose pages have already been written
+   * directly to the file via {@link #writePageBytesNonContiguous(BytesInput)} and (optionally)
+   * {@link #writeDictionaryPageNonContiguous(DictionaryPage, BlockCipher.Encryptor, byte[])}.
+   *
+   * <p>This method records {@code data_page_offset = -1} and (via
+   * {@link ParquetMetadataConverter}) {@code ColumnChunk.file_offset = -1} so that readers
+   * which do not support non-contiguous pages will fail loudly on a -1 seek rather than
+   * silently reading invalid bytes. Page locations are taken from the supplied
+   * {@code offsetIndexBuilder}, whose entries are assumed to be absolute file offsets.
+   *
+   * @param descriptor          column descriptor
+   * @param valueCount          total values written across all pages
+   * @param compressionCodecName compression codec used for all pages
+   * @param dictionaryPageOffset absolute offset of the dictionary page, or {@code 0} if none
+   * @param dictionaryPageLength serialized length of the dictionary page including its header,
+   *                            or {@code -1} if no dictionary page is present
+   * @param dictionaryEncoding  encoding used by the dictionary page, or {@code null} if no
+   *                            dictionary page is present
+   * @param uncompressedTotalSize total uncompressed size of all pages including headers
+   * @param compressedTotalSize total compressed size of all pages including headers
+   * @param totalStats          accumulated column statistics
+   * @param totalSizeStats      accumulated size statistics
+   * @param totalGeospatialStats accumulated geospatial statistics
+   * @param columnIndexBuilder  populated column index builder
+   * @param offsetIndexBuilder  populated offset index builder (absolute offsets)
+   * @param bloomFilter         optional bloom filter
+   * @param rlEncodings         repetition level encodings used in this chunk
+   * @param dlEncodings         definition level encodings used in this chunk
+   * @param dataEncodings       data encodings used in this chunk
+   * @throws IOException if there is an error while writing
+   */
+  void writeColumnChunkNonContiguous(
+      ColumnDescriptor descriptor,
+      long valueCount,
+      CompressionCodecName compressionCodecName,
+      long dictionaryPageOffset,
+      int dictionaryPageLength,
+      Encoding dictionaryEncoding,
+      long uncompressedTotalSize,
+      long compressedTotalSize,
+      Statistics<?> totalStats,
+      SizeStatistics totalSizeStats,
+      GeospatialStatistics totalGeospatialStats,
+      ColumnIndexBuilder columnIndexBuilder,
+      OffsetIndexBuilder offsetIndexBuilder,
+      BloomFilter bloomFilter,
+      Set<Encoding> rlEncodings,
+      Set<Encoding> dlEncodings,
+      List<Encoding> dataEncodings)
+      throws IOException {
+    withAbortOnFailure(() -> {
+      // BLOCK -> COLUMN; pages are already on disk, so we skip the write() transition.
+      startColumn(descriptor, valueCount, compressionCodecName);
+
+      // The sentinel; endColumn() detects this and skips the OffsetIndex shift, and the
+      // metadata converter emits file_offset = -1 on the on-disk ColumnChunk.
+      this.currentChunkFirstDataPage = -1L;
+      this.currentChunkDictionaryPageOffset = dictionaryPageOffset;
+      this.currentChunkDictionaryPageLength = dictionaryPageLength;
+      this.uncompressedLength = uncompressedTotalSize;
+      this.compressedLength = compressedTotalSize;
+      this.currentStatistics = totalStats;
+      this.currentSizeStatistics = totalSizeStats;
+      this.currentGeospatialStatistics = totalGeospatialStats;
+      this.columnIndexBuilder = columnIndexBuilder;
+      this.offsetIndexBuilder = offsetIndexBuilder;
+
+      encodingStatsBuilder.addDataEncodings(dataEncodings);
+      if (rlEncodings.isEmpty()) {
+        encodingStatsBuilder.withV2Pages();
+      }
+      if (dictionaryEncoding != null) {
+        encodingStatsBuilder.addDictEncoding(dictionaryEncoding);
+        currentEncodings.add(dictionaryEncoding);
+      }
+      currentEncodings.addAll(rlEncodings);
+      currentEncodings.addAll(dlEncodings);
+      currentEncodings.addAll(dataEncodings);
+
+      if (bloomFilter != null) {
+        boolean isWriteBloomFilter = false;
+        for (Encoding encoding : dataEncodings) {
+          if (encoding != Encoding.PLAIN_DICTIONARY && encoding != Encoding.RLE_DICTIONARY) {
+            isWriteBloomFilter = true;
+            break;
+          }
+        }
+        if (isWriteBloomFilter) {
+          currentBloomFilters.put(String.join(".", descriptor.getPath()), bloomFilter);
+        }
+      }
+
+      endColumn();
+    });
+  }
+
+  /**
    * Overwrite the column total statistics. This special used when the column total statistics
    * is known while all the page statistics are invalid, for example when rewriting the column.
    *
@@ -1590,8 +1762,12 @@ public class ParquetFileWriter implements AutoCloseable {
       } else {
         currentColumnIndexes.add(columnIndexBuilder.build());
       }
-      currentOffsetIndexes.add(offsetIndexBuilder.build(currentChunkFirstDataPage));
-      currentBlock.addColumn(ColumnChunkMetaData.get(
+      // In non-contiguous mode the OffsetIndex was populated with absolute file offsets
+      // directly, so no shift is applied. In contiguous mode the builder holds
+      // chunk-relative offsets and is shifted by the chunk's starting position.
+      long offsetIndexShift = (currentChunkFirstDataPage == -1) ? 0 : currentChunkFirstDataPage;
+      currentOffsetIndexes.add(offsetIndexBuilder.build(offsetIndexShift));
+      ColumnChunkMetaData column = ColumnChunkMetaData.get(
           currentChunkPath,
           currentChunkType,
           currentChunkCodec,
@@ -1604,11 +1780,16 @@ public class ParquetFileWriter implements AutoCloseable {
           compressedLength,
           uncompressedLength,
           currentSizeStatistics,
-          currentGeospatialStatistics));
+          currentGeospatialStatistics);
+      if (currentChunkDictionaryPageLength > 0) {
+        column.setDictionaryPageLength(currentChunkDictionaryPageLength);
+      }
+      currentBlock.addColumn(column);
       this.currentBlock.setTotalByteSize(currentBlock.getTotalByteSize() + uncompressedLength);
       this.uncompressedLength = 0;
       this.compressedLength = 0;
       this.currentChunkDictionaryPageOffset = 0;
+      this.currentChunkDictionaryPageLength = -1;
       columnIndexBuilder = null;
       offsetIndexBuilder = null;
     });

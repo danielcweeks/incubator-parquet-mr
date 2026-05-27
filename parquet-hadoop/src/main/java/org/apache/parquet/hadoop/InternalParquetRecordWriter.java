@@ -115,7 +115,9 @@ class InternalParquetRecordWriter<T> {
         props.getColumnIndexTruncateLength(),
         props.getPageWriteChecksumEnabled(),
         fileEncryptor,
-        rowGroupOrdinal);
+        rowGroupOrdinal,
+        props.isNonContiguousPageWriteEnabled(),
+        parquetFileWriter);
     pageStore = columnChunkPageWriteStore;
     bloomFilterWriteStore = columnChunkPageWriteStore;
 

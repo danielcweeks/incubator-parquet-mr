@@ -308,12 +308,17 @@ public abstract class ColumnChunkMetaData {
   }
 
   /**
-   * @return the offset of the first byte in the chunk
+   * @return the offset of the first byte in the chunk, or {@code -1} if the column chunk's
+   * pages are non-contiguous in the file (no single starting offset exists; readers must use
+   * the OffsetIndex to locate each page)
    */
   public long getStartingPos() {
     decryptIfNeeded();
-    long dictionaryPageOffset = getDictionaryPageOffset();
     long firstDataPageOffset = getFirstDataPageOffset();
+    if (firstDataPageOffset == -1) {
+      return -1;
+    }
+    long dictionaryPageOffset = getDictionaryPageOffset();
     if (dictionaryPageOffset > 0 && dictionaryPageOffset < firstDataPageOffset) {
       // if there's a dictionary and it's before the first data page, start from there
       return dictionaryPageOffset;
@@ -342,6 +347,7 @@ public abstract class ColumnChunkMetaData {
 
   private long bloomFilterOffset = -1;
   private int bloomFilterLength = -1;
+  private int dictionaryPageLength = -1;
 
   protected ColumnChunkMetaData(ColumnChunkProperties columnChunkProperties) {
     this(null, columnChunkProperties);
@@ -504,6 +510,28 @@ public abstract class ColumnChunkMetaData {
   public int getBloomFilterLength() {
     decryptIfNeeded();
     return bloomFilterLength;
+  }
+
+  /**
+   * Method should be considered private.
+   *
+   * @param dictionaryPageLength the serialized size of the dictionary page including its page
+   *                             header, or {@code -1} if there is no dictionary page or the
+   *                             length is unknown
+   */
+  public void setDictionaryPageLength(int dictionaryPageLength) {
+    this.dictionaryPageLength = dictionaryPageLength;
+  }
+
+  /**
+   * @return the serialized size of the dictionary page including its page header, or {@code -1}
+   *         if there is no dictionary page or the length was not recorded. Writers producing
+   *         non-contiguous pages MUST populate this field so readers can locate the dictionary
+   *         page in a single I/O.
+   */
+  public int getDictionaryPageLength() {
+    decryptIfNeeded();
+    return dictionaryPageLength;
   }
 
   /**
@@ -851,6 +879,9 @@ class EncryptedColumnChunkMetaData extends ColumnChunkMetaData {
     }
     if (metaData.isSetBloom_filter_length()) {
       setBloomFilterLength(metaData.getBloom_filter_length());
+    }
+    if (metaData.isSetDictionary_page_length()) {
+      setDictionaryPageLength(metaData.getDictionary_page_length());
     }
   }
 
